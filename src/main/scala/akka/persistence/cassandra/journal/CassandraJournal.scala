@@ -12,7 +12,6 @@ import scala.util.Success
 import scala.util.Try
 import java.nio.ByteBuffer
 import java.lang.{ Long => JLong }
-
 import com.datastax.driver.core._
 import com.datastax.driver.core.exceptions.DriverException
 import com.datastax.driver.core.policies.LoggingRetryPolicy
@@ -21,12 +20,14 @@ import com.datastax.driver.core.policies.RetryPolicy.RetryDecision
 import com.datastax.driver.core.utils.Bytes
 import com.datastax.driver.core.utils.UUIDs
 import com.typesafe.config.Config
-
 import akka.persistence._
 import akka.persistence.cassandra._
 import akka.persistence.journal.AsyncWriteJournal
 import akka.persistence.journal.Tagged
 import akka.serialization.SerializationExtension
+import akka.serialization.Serialization
+import akka.actor.ExtendedActorSystem
+import akka.serialization.SerializerWithStringManifest
 
 class CassandraJournal(cfg: Config) extends AsyncWriteJournal with CassandraRecovery with CassandraStatements {
 
@@ -126,7 +127,7 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal with CassandraReco
               (pr.withPayload(payload), tags)
             case _ => (pr, Set.empty[String])
           }
-          Serialized(pr.sequenceNr, persistentToByteBuffer(pr2), tags)
+          serializeEvent(pr2, tags)
         }
       )
     }
@@ -173,6 +174,14 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal with CassandraReco
       bs.setLong("sequence_nr", m.sequenceNr)
       bs.setUUID("timestamp", nowUuid)
       bs.setString("timebucket", TimeBucket(now).key)
+      bs.setString("writer_uuid", m.writerUuid)
+      bs.setInt("ser_id", m.serId)
+      bs.setString("ser_manifest", m.serManifest)
+      bs.setString("event_manifest", m.eventManifest)
+      bs.setBytes("event", m.serialized)
+      // for backwards compatibility
+      bs.setToNull("message") // FIXME is this needed?
+
       if (m.tags.nonEmpty) {
         var tagCounts = Array.ofDim[Int](maxTagsPerEvent)
         m.tags.foreach { tag =>
@@ -189,7 +198,8 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal with CassandraReco
           }
         }
       }
-      bs.setBytes("message", m.serialized)
+
+      bs
     }
     // in case we skip an entire partition we want to make sure the empty partition has in in-use flag so scans
     // keep going when they encounter it
@@ -293,15 +303,42 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal with CassandraReco
   private def minSequenceNr(partitionNr: Long): Long =
     partitionNr * targetPartitionSize + 1
 
-  private def persistentToByteBuffer(p: PersistentRepr): ByteBuffer =
-    ByteBuffer.wrap(serialization.serialize(p).get)
+  private lazy val transportInformation: Option[Serialization.Information] = {
+    val address = context.system.asInstanceOf[ExtendedActorSystem].provider.getDefaultAddress
+    if (address.hasLocalScope) None
+    else Some(Serialization.Information(address, context.system))
+  }
+
+  private def serializeEvent(p: PersistentRepr, tags: Set[String]): Serialized = {
+    def doSerializeEvent(): Serialized = {
+      val event: AnyRef = p.payload.asInstanceOf[AnyRef]
+      val serializer = serialization.findSerializerFor(event)
+      val serManifest = serializer match {
+        case ser2: SerializerWithStringManifest ⇒
+          ser2.manifest(event)
+        case _ ⇒
+          if (serializer.includeManifest) event.getClass.getName
+          else PersistentRepr.Undefined
+      }
+      val serEvent = ByteBuffer.wrap(serialization.serialize(event).get)
+      Serialized(p.persistenceId, p.sequenceNr, serEvent, tags, p.manifest, serManifest,
+        serializer.identifier, p.writerUuid)
+    }
+
+    // serialize actor references with full address information (defaultAddress)
+    transportInformation match {
+      case Some(ti) ⇒ Serialization.currentTransportInformation.withValue(ti) { doSerializeEvent() }
+      case None     ⇒ doSerializeEvent()
+    }
+  }
 
   private def persistentFromByteBuffer(b: ByteBuffer): PersistentRepr = {
     serialization.deserialize(Bytes.getArray(b), classOf[PersistentRepr]).get
   }
 
   private case class SerializedAtomicWrite(persistenceId: String, payload: Seq[Serialized])
-  private case class Serialized(sequenceNr: Long, serialized: ByteBuffer, tags: Set[String])
+  private case class Serialized(persistenceId: String, sequenceNr: Long, serialized: ByteBuffer, tags: Set[String],
+                                eventManifest: String, serManifest: String, serId: Int, writerUuid: String)
   private case class PartitionInfo(partitionNr: Long, minSequenceNr: Long, maxSequenceNr: Long)
 
   /**
@@ -342,11 +379,33 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal with CassandraReco
       while (iter.hasNext && n == null) {
         val row = iter.next()
         val snr = row.getLong("sequence_nr")
-        val m = persistentFromByteBuffer(row.getBytes("message"))
+        val m = row.getBytes("message") match {
+          case null =>
+            PersistentRepr(
+              payload = deserializeEvent(row),
+              sequenceNr = row.getLong("sequence_nr"),
+              persistenceId = row.getString("persistence_id"),
+              manifest = row.getString("event_manifest"),
+              deleted = false,
+              sender = null,
+              writerUuid = row.getString("writer_uuid")
+            )
+          case b =>
+            // for backwards compatibility
+            persistentFromByteBuffer(b)
+        }
         // there may be duplicates returned by iter
         // (on scan boundaries within a partition)
         if (snr == c.sequenceNr) c = m else n = m
       }
+    }
+
+    private def deserializeEvent(row: Row): Any = {
+      serialization.deserialize(
+        row.getBytes("event").array,
+        row.getInt("ser_id"),
+        row.getString("ser_manifest")
+      ).get
     }
   }
 

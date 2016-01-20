@@ -81,7 +81,29 @@ private[query] class EventsByPersistenceIdPublisher(
   }
 
   private[this] def extractEvent(row: Row): PersistentRepr =
-    persistentFromByteBuffer(serialization, row.getBytes("message"))
+    row.getBytes("message") match {
+      case null =>
+        PersistentRepr(
+          payload = deserializeEvent(row),
+          sequenceNr = row.getLong("sequence_nr"),
+          persistenceId = row.getString("persistence_id"),
+          manifest = row.getString("event_manifest"),
+          deleted = false,
+          sender = null,
+          writerUuid = row.getString("writer_uuid")
+        )
+      case b =>
+        // for backwards compatibility
+        persistentFromByteBuffer(serialization, b)
+    }
+
+  private def deserializeEvent(row: Row): Any = {
+    serialization.deserialize(
+      row.getBytes("event").array,
+      row.getInt("ser_id"),
+      row.getString("ser_manifest")
+    ).get
+  }
 
   private[this] def persistentFromByteBuffer(
     serialization: Serialization,
